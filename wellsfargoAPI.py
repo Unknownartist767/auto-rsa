@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import pickle
 import re
 import traceback
 from time import sleep
@@ -32,7 +33,11 @@ from helperAPI import (
 
 def wellsfargo_error(driver: webdriver, error: str):
     print(f"Wells Fargo Error: {error}")
-    driver.save_screenshot(f"wells-fargo-error-{datetime.datetime.now()}.png")
+    if driver is not None:
+        try:
+            driver.save_screenshot(f"wells-fargo-error-{datetime.datetime.now()}.png")
+        except Exception:
+            pass
     print(traceback.format_exc())
 
 
@@ -48,97 +53,146 @@ def wellsfargo_init(botObj, WELLSFARGO_EXTERNAL=None, DOCKER=False, loop=None):
         else WELLSFARGO_EXTERNAL.strip().split(",")
     )
     WELLSFARGO_obj = Brokerage("WELLSFARGO")
+    
+    # Add cookie persistence
+    cookie_file = os.path.join("creds", f"wellsfargo_cookies_{datetime.datetime.now().strftime('%Y%m%d')}.pkl")
+    
     for account in accounts:
         index = accounts.index(account) + 1
         name = f"WELLSFARGO {index}"
         account = account.split(":")
-        try:
-            printAndDiscord("Logging into WELLS FARGO...", loop)
-            driver = getDriver(DOCKER)
-            if driver is None:
-                raise Exception("Driver not found.")
-            driver.get("https://connect.secure.wellsfargo.com/auth/login/present")
-            WebDriverWait(driver, 20).until(check_if_page_loaded)
-            # Login
+        
+        # Implement exponential backoff for retries
+        max_retries = 3
+        retry_delay = 1
+        for retry in range(max_retries):
             try:
-                username_field = driver.find_element(By.XPATH, "//*[@id='j_username']")
-                type_slowly(username_field, account[0])
-                # Wait for the password field and enter the password
-                password_field = driver.find_element(By.XPATH, "//*[@id='j_password']")
-                type_slowly(password_field, account[1])
-
-                login_button = WebDriverWait(driver, 20).until(
-                    EC.element_to_be_clickable(
-                        (By.CSS_SELECTOR, ".Button__modern___cqCp7")
-                    )
-                )
-                login_button.click()
+                printAndDiscord("Logging into WELLS FARGO...", loop)
+                driver = getDriver(DOCKER)
+                if driver is None:
+                    raise Exception("Driver not found.")
+                
+                # Load cookies if they exist
+                if os.path.exists(cookie_file):
+                    try:
+                        driver.get("https://connect.secure.wellsfargo.com")
+                        cookies = pickle.load(open(cookie_file, "rb"))
+                        for cookie in cookies:
+                            driver.add_cookie(cookie)
+                    except Exception as e:
+                        print(f"Error loading cookies: {e}")
+                
+                driver.get("https://connect.secure.wellsfargo.com/auth/login/present")
                 WebDriverWait(driver, 20).until(check_if_page_loaded)
-                print("=====================================================\n")
-            except TimeoutException:
-                print("TimeoutException: Login failed.")
-                return False
-            WELLSFARGO_obj.set_logged_in_object(name, driver)
-            try:
-                auth_popup = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located(
-                        (
-                            By.CSS_SELECTOR,
-                            ".ResponsiveModalContent__modalContent___guT3p",
+                # Login
+                try:
+                    username_field = driver.find_element(By.XPATH, "//*[@id='j_username']")
+                    type_slowly(username_field, account[0])
+                    # Wait for the password field and enter the password
+                    password_field = driver.find_element(By.XPATH, "//*[@id='j_password']")
+                    type_slowly(password_field, account[1])
+
+                    login_button = WebDriverWait(driver, 20).until(
+                        EC.element_to_be_clickable(
+                            (By.CSS_SELECTOR, ".Button__modern___cqCp7")
                         )
                     )
+                    login_button.click()
+                    WebDriverWait(driver, 20).until(check_if_page_loaded)
+                    print("=====================================================\n")
+                except TimeoutException:
+                    print("TimeoutException: Login failed.")
+                    return False
+
+                WELLSFARGO_obj.set_logged_in_object(name, driver)
+                
+                try:
+                    auth_popup = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located(
+                            (
+                                By.CSS_SELECTOR,
+                                ".ResponsiveModalContent__modalContent___guT3p",
+                            )
+                        )
+                    )
+                    auth_list = auth_popup.find_element(
+                        By.CSS_SELECTOR, ".LineItemLinkList__lineItemLinkList___Dj6vb"
+                    )
+                    li_elements = auth_list.find_elements(By.TAG_NAME, "li")
+                    for li in li_elements:
+                        if account[2] in li.text:
+                            li.click()
+                            break
+                    print("Clicked on phone number")
+                    # Get the OTP code from the user
+                    if botObj is not None and loop is not None:
+                        code = asyncio.run_coroutine_threadsafe(
+                            getOTPCodeDiscord(botObj, name, timeout=300, loop=loop),
+                            loop,
+                        ).result()
+                    else:
+                        code = input("Enter security code: ")
+                    code_input = WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.ID, "otp"))
+                    )
+                    code_input.send_keys(code)
+                    WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
+                    ).click()
+                except TimeoutException:
+                    pass
+
+                try:
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.LINK_TEXT, "Locations"))
+                    )
+                except TimeoutException:
+                    print("Could not verify login success")
+                    raise
+                
+                # Save cookies after successful login
+                try:
+                    pickle.dump(driver.get_cookies(), open(cookie_file, "wb"))
+                except Exception as e:
+                    print(f"Error saving cookies: {e}")
+
+                # TODO: This will not show accounts that do not have settled cash funds
+                account_blocks = driver.find_elements(
+                    By.CSS_SELECTOR, 'li[data-testid^="WELLSTRADE"]'
                 )
-                auth_list = auth_popup.find_element(
-                    By.CSS_SELECTOR, ".LineItemLinkList__lineItemLinkList___Dj6vb"
-                )
-                li_elements = auth_list.find_elements(By.TAG_NAME, "li")
-                for li in li_elements:
-                    if account[2] in li.text:
-                        li.click()
-                        break
-                print("Clicked on phone number")
-                # Get the OTP code from the user
-                if botObj is not None and loop is not None:
-                    code = asyncio.run_coroutine_threadsafe(
-                        getOTPCodeDiscord(botObj, name, timeout=300, loop=loop),
-                        loop,
-                    ).result()
-                else:
-                    code = input("Enter security code: ")
-                code_input = WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.ID, "otp"))
-                )
-                code_input.send_keys(code)
-                WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
-                ).click()
+                for account_block in account_blocks:
+                    masked_number_element = account_block.find_element(
+                        By.CSS_SELECTOR, '[data-testid$="-masked-number"]'
+                    )
+                    masked_number_text = masked_number_element.text.replace(".", "*")
+                    WELLSFARGO_obj.set_account_number(name, masked_number_text)
+                    balance_element = account_block.find_element(
+                        By.CSS_SELECTOR, '[data-testid$="-balance"]'
+                    )
+                    balance = float(balance_element.text.replace("$", "").replace(",", ""))
+                    WELLSFARGO_obj.set_account_totals(name, masked_number_text, balance)
+
             except TimeoutException:
-                pass
-
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.LINK_TEXT, "Locations"))
-            )
-
-            # TODO: This will not show accounts that do not have settled cash funds
-            account_blocks = driver.find_elements(
-                By.CSS_SELECTOR, 'li[data-testid^="WELLSTRADE"]'
-            )
-            for account_block in account_blocks:
-                masked_number_element = account_block.find_element(
-                    By.CSS_SELECTOR, '[data-testid$="-masked-number"]'
-                )
-                masked_number_text = masked_number_element.text.replace(".", "*")
-                WELLSFARGO_obj.set_account_number(name, masked_number_text)
-                balance_element = account_block.find_element(
-                    By.CSS_SELECTOR, '[data-testid$="-balance"]'
-                )
-                balance = float(balance_element.text.replace("$", "").replace(",", ""))
-                WELLSFARGO_obj.set_account_totals(name, masked_number_text, balance)
-        except Exception as e:
-            wellsfargo_error(driver, e)
-            driver.close()
-            driver.quit()
-            return None
+                if retry < max_retries - 1:
+                    wait_time = retry_delay * (2 ** retry)  # Exponential backoff
+                    print(f"Timeout occurred, retrying in {wait_time} seconds...")
+                    sleep(wait_time)
+                    continue
+                wellsfargo_error(driver, f"Timeout after {max_retries} retries")
+                driver.close()
+                driver.quit()
+                return None
+            except WebDriverException as e:
+                wellsfargo_error(driver, f"WebDriver error: {e}")
+                driver.close()
+                driver.quit()
+                return None
+            except Exception as e:
+                wellsfargo_error(driver, f"Unexpected error: {e}")
+                driver.close()
+                driver.quit()
+                return None
+            break  # Success - exit retry loop
     return WELLSFARGO_obj
 
 
@@ -152,10 +206,17 @@ def wellsfargo_holdings(WELLSFARGO_o: Brokerage, loop=None):
             brokerage.click()
 
             try:
+                # Wait for SVG to be removed
+                WebDriverWait(driver, 20).until_not(
+                    EC.presence_of_element_located((By.CLASS_NAME, "wfa-lob"))
+                )
+                
                 more = WebDriverWait(driver, 20).until(
                     EC.element_to_be_clickable((By.LINK_TEXT, "Holdings Snapshot"))
                 )
-                more.click()
+                driver.execute_script("arguments[0].scrollIntoView(true);", more)
+                sleep(2)  # Give more time for any animations to complete
+                driver.execute_script("arguments[0].click();", more)  # Use JavaScript click
                 position = WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable((By.ID, "btnpositions"))
                 )
@@ -197,9 +258,7 @@ def wellsfargo_holdings(WELLSFARGO_o: Brokerage, loop=None):
                         continue
                     try:
                         open_dropdown = WebDriverWait(driver, 20).until(
-                            EC.element_to_be_clickable(
-                                (By.XPATH, "//*[@id='dropdown1']")
-                            )
+                            EC.element_to_be_clickable((By.XPATH, "//*[@id='dropdown1']"))
                         )
                         open_dropdown.click()
                         sleep(1)
