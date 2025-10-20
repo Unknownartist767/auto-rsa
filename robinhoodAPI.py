@@ -10,12 +10,30 @@ from dotenv import load_dotenv
 from helperAPI import Brokerage, maskString, printAndDiscord, printHoldings, stockOrder
 
 
-def login_with_cache(pickle_path, pickle_name):
-    rh.login(
-        expiresIn=86400 * 30,  # 30 days
-        pickle_path=pickle_path,
-        pickle_name=pickle_name,
-    )
+def login_with_cache(pickle_path, pickle_name, username=None, password=None):
+    try:
+        # Try to use cached session
+        rh.login(
+            expiresIn=86400 * 30,  # 30 days
+            pickle_path=pickle_path,
+            pickle_name=pickle_name,
+            store_session=True,  # Always store session to reduce login prompts
+        )
+    except Exception as e:
+        if username and password:
+            # If cached session fails, login with credentials
+            print(f"Cached session failed: {e}")
+            print("Logging in with credentials...")
+            rh.login(
+                username=username,
+                password=password,
+                store_session=True,
+                expiresIn=86400 * 30,  # 30 days
+                pickle_path=pickle_path,
+                pickle_name=pickle_name,
+            )
+        else:
+            raise
 
 
 def robinhood_init(ROBINHOOD_EXTERNAL=None, botObj=None, loop=None):
@@ -82,23 +100,60 @@ def robinhood_holdings(rho: Brokerage, loop=None):
     for key in rho.get_account_numbers():
         for account in rho.get_account_numbers(key):
             obj: rh = rho.get_logged_in_objects(key)
-            login_with_cache(pickle_path="./creds/", pickle_name=key)
+            # Get credentials from environment
+            RH = os.environ["ROBINHOOD"].strip().split(",")
+            creds = None
+            for rh_account in RH:
+                if key.split()[-1] == str(RH.index(rh_account) + 1):
+                    creds = rh_account.split(":")
+                    break
+            
             try:
+                login_with_cache(
+                    pickle_path="./creds/",
+                    pickle_name=key,
+                    username=creds[0] if creds else None,
+                    password=creds[1] if creds else None
+                )
+                
                 # Get account holdings
                 positions = obj.get_open_stock_positions(account_number=account)
                 if positions != []:
                     for item in positions:
-                        # Get symbol, quantity, price, and total value
-                        sym = item["symbol"] = obj.get_symbol_by_url(item["instrument"])
-                        qty = float(item["quantity"])
                         try:
-                            current_price = round(
-                                float(obj.stocks.get_latest_price(sym)[0]), 2
-                            )
-                        except TypeError as e:
-                            if "NoneType" in str(e):
-                                current_price = "N/A"
-                        rho.set_holdings(key, account, sym, qty, current_price)
+                            # First try to get symbol from the position data
+                            sym = item.get("symbol")
+                            if not sym:
+                                try:
+                                    # If symbol not in position data, try to get it from instrument URL
+                                    instrument_id = item["instrument"].split("/")[-2]  # Get ID from URL
+                                    instrument_data = obj.get_instrument_by_url(f"https://api.robinhood.com/instruments/{instrument_id}/")
+                                    sym = instrument_data.get("symbol")
+                                except Exception as e:
+                                    print(f"Error getting symbol from instrument {item.get('instrument')}: {e}")
+                                    continue
+
+                            if not sym:
+                                print(f"Could not determine symbol for holding: {item}")
+                                continue
+
+                            qty = float(item["quantity"])
+                            try:
+                                quote = obj.stocks.get_latest_price(sym)
+                                if quote and quote[0]:
+                                    current_price = round(float(quote[0]), 2)
+                                else:
+                                    print(f"No price data available for {sym}")
+                                    current_price = 0.00
+                            except Exception as e:
+                                print(f"Error getting price for {sym}: {e}")
+                                current_price = 0.00
+                            
+                            if sym and qty >= 0:  # Only add valid holdings
+                                rho.set_holdings(key, account, sym, qty, current_price)
+                        except Exception as e:
+                            print(f"Error processing holding: {e}")
+                            continue
             except Exception as e:
                 printAndDiscord(f"{key}: Error getting account holdings: {e}", loop)
                 print(traceback.format_exc())
