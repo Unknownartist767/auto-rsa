@@ -95,17 +95,62 @@ def schwab_transaction(schwab_o: Brokerage, orderObj: stockOrder, loop=None):
                 loop,
             )
             obj: Schwab = schwab_o.get_logged_in_objects(key)
-            for account in schwab_o.get_account_numbers(key):
+            
+            # Get all accounts and identify the trading-enabled account (one with "142")
+            all_accounts = schwab_o.get_account_numbers(key)
+            trading_account = None
+            
+            # First, check if SCHWAB_ACCOUNT_NUMBERS is specified
+            if purchase_accounts != [""]:
+                for account in all_accounts:
+                    if str(account) in purchase_accounts:
+                        trading_account = account
+                        break
+            else:
+                # Check if account suffix is provided in the SCHWAB credential string (4th parameter)
+                account_suffix = None
+                schwab_creds = os.environ["SCHWAB"].strip().split(",") if os.getenv("SCHWAB") else []
+                
+                for cred_str in schwab_creds:
+                    cred_parts = cred_str.split(":")
+                    if len(cred_parts) >= 4 and cred_parts[3].strip():
+                        account_suffix = cred_parts[3].strip()
+                        print(f"Using Schwab account suffix from credentials: {account_suffix}")
+                        break
+                
+                # If not in credentials, check for SCHWAB_ACCOUNT_SUFFIX in .env (backward compatibility)
+                if not account_suffix:
+                    account_suffix = os.getenv("SCHWAB_ACCOUNT_SUFFIX", "").strip()
+                    if account_suffix:
+                        print(f"Using Schwab account suffix from SCHWAB_ACCOUNT_SUFFIX: {account_suffix}")
+                
+                if account_suffix:
+                    # Look for account ending with the specified suffix
+                    for account in all_accounts:
+                        if str(account).endswith(account_suffix):
+                            trading_account = account
+                            print(f"Found matching Schwab account: {maskString(account)} (ends with '{account_suffix}')")
+                            break
+                    
+                    if not trading_account:
+                        print(f"Warning: No account found ending with '{account_suffix}'")
+                        print("Available accounts:")
+                        for account in all_accounts:
+                            print(f"  - {maskString(account)} (ends with: ...{str(account)[-4:] if len(str(account)) >= 4 else str(account)})")
+                
+                # Fallback: if no account suffix found or no match, use first account
+                if not trading_account and all_accounts:
+                    trading_account = all_accounts[0]
+                    print(f"No account suffix specified or no match found, using first account: {maskString(trading_account)}")
+                    print("To specify which account to use, add account suffix as 4th parameter in SCHWAB credentials")
+                    print("Example: SCHWAB=username:password:totp_secret:8142")
+                    print("Or use SCHWAB_ACCOUNT_SUFFIX environment variable")
+            
+            # Only trade with the identified trading account
+            if trading_account:
+                account = trading_account
                 print_account = maskString(account)
-                if (
-                    purchase_accounts != [""]
-                    and orderObj.get_action().lower() != "sell"
-                    and str(account) not in purchase_accounts
-                ):
-                    print(
-                        f"Skipping account {print_account}, not in SCHWAB_ACCOUNT_NUMBERS"
-                    )
-                    continue
+                
                 # If DRY is True, don't actually make the transaction
                 if orderObj.get_dry():
                     printAndDiscord(
@@ -178,3 +223,5 @@ def schwab_transaction(schwab_o: Brokerage, orderObj: stockOrder, loop=None):
                     )
                     print(traceback.format_exc())
                 sleep(1)
+            else:
+                print("No trading account identified for Schwab")
