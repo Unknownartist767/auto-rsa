@@ -135,21 +135,37 @@ def sofi_run(
             name = f"SoFi {index}"
             cookie_filename = f"{COOKIES_PATH}/{name}.pkl"
             browser_args = [
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-setuid-sandbox",
+                "--window-size=1920,1080"
             ]
             if headless:
                 browser_args.append("--headless=new")
-            browser = sofi_loop.run_until_complete(uc.start(browser_args=browser_args))
+            # Use Brave browser instead of Chrome
+            browser = sofi_loop.run_until_complete(uc.start(
+                browser_args=browser_args,
+                browser_executable_path="C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+            ))
+            # Give browser time to initialize
+            sofi_loop.run_until_complete(browser.sleep(3))
             print(f"Logging into {name}...")
-            sofi_init(
+            login_result = sofi_init(
                 account, name, cookie_filename, botObj, browser, discord_loop, sofi_obj
             )
             sofi_loop.run_until_complete(browser.sleep(5))
-            print(f"Logged in to {name}!")
-            if second_command == "_holdings":
-                sofi_holdings(browser, name, sofi_obj, discord_loop)
+            if login_result:
+                print(f"Logged in to {name}!")
+                # Set logged-in status in the order object, not the brokerage object
+                orderObj.set_logged_in(sofi_obj, "sofi")
+                if second_command == "_holdings":
+                    sofi_holdings(browser, name, sofi_obj, discord_loop)
+                else:
+                    sofi_transaction(browser, orderObj, discord_loop)
             else:
-                sofi_transaction(browser, orderObj, discord_loop)
+                print(f"Failed to log in to {name}")
     except Exception as e:
         sofi_loop.run_until_complete(
             sofi_error(
@@ -185,15 +201,29 @@ def sofi_init(
         max_attempts = 5
         attempts = 0
         while attempts < max_attempts:
-            page = sofi_loop.run_until_complete(browser.get("https://www.sofi.com/"))
-            sofi_loop.run_until_complete(page)  # Wait for events to be processed
-            current_url = sofi_loop.run_until_complete(
-                get_current_url(page, discord_loop)
-            )
-            if current_url == "https://www.sofi.com/":
-                break
-
+            try:
+                page = sofi_loop.run_until_complete(browser.get("https://www.sofi.com/"))
+                sofi_loop.run_until_complete(browser.sleep(5))  # Give page time to load
+                
+                # Wait for page to load and check body element
+                sofi_loop.run_until_complete(browser.sleep(3))
+                try:
+                    await_body = sofi_loop.run_until_complete(page.select("body"))
+                    if await_body:
+                        current_url = sofi_loop.run_until_complete(
+                            get_current_url(page, discord_loop)
+                        )
+                        if current_url and "sofi.com" in current_url.lower():
+                            break
+                except Exception as e:
+                    print(f"Waiting for body element: {e}")
+            except Exception as e:
+                print(f"Attempt {attempts + 1} failed: {e}")
+                sofi_loop.run_until_complete(browser.sleep(2))
+            
             attempts += 1
+            if attempts == max_attempts:
+                raise Exception("Failed to load SoFi homepage after multiple attempts")
 
         # Load cookies
         sofi_loop.run_until_complete(page)  # Wait for events to be processed
@@ -236,33 +266,148 @@ def sofi_init(
 
 async def sofi_login_and_account(browser, page, account, name, botObj, discord_loop):
     try:
-        sleep(5)
-        page = await browser.get("https://www.sofi.com")
+        print(f"Starting login process for {name}")
+        
+        # Start with the main login page
+        await browser.sleep(5)
+        page = await browser.get("https://www.sofi.com/login")
         if not page:
             raise Exception(f"Failed to load SoFi login page for {name}")
 
-        await page.get("https://www.sofi.com/wealth/app")
-        sleep(2)
-        username_input = await page.select("input[id=username]")
-        if not username_input:
-            raise Exception(f"Unable to locate the username input field for {name}")
-        await username_input.send_keys(account[0])
+        await browser.sleep(10)  # Give more time for page to load
 
-        password_input = await page.select("input[type=password]")
-        if not password_input:
-            raise Exception(f"Unable to locate the password input field for {name}")
-        await password_input.send_keys(account[1])
-
-        login_button = await page.find("Log In", best_match=True)
-        if not login_button:
-            raise Exception(f"Unable to locate the login button for {name}")
-        await login_button.click()
-
+        # Wait for page to be ready and check URL
         await page.select("body")
-
         current_url = await get_current_url(page, discord_loop)
-        if current_url is not None and "overview" not in current_url:
+        print(f"Login page URL: {current_url}")
+        
+        if not current_url or "login" not in current_url:
+            await browser.sleep(5)
+            await page.get("https://www.sofi.com/login")
+            await browser.sleep(10)
+            current_url = await get_current_url(page, discord_loop)
+
+        # Wait for and fill email field
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                print(f"Attempt {attempt + 1} to find email field")
+                # Try multiple selectors for email field
+                email_selectors = [
+                    "input[aria-label='Email']",
+                    "input[type='email']",
+                    "input[name='email']",
+                    "input[placeholder*='email']",
+                    "input[placeholder*='Email']",
+                    "textbox[aria-label='Email']",
+                    "input[autocomplete='email']"
+                ]
+                
+                email_input = None
+                for selector in email_selectors:
+                    try:
+                        email_input = await page.select(selector)
+                        if email_input:
+                            print(f"Found email field with selector: {selector}")
+                            break
+                    except Exception:
+                        continue
+                
+                if email_input:
+                    await email_input.send_keys(account[0])
+                    await browser.sleep(2)
+                    print("Email entered successfully")
+                    break
+                else:
+                    await browser.sleep(5)
+            except Exception as e:
+                print(f"Attempt {attempt + 1} to find email field failed: {e}")
+                if attempt == max_attempts - 1:
+                    return None
+
+        # Wait for and fill password field
+        for attempt in range(max_attempts):
+            try:
+                print(f"Attempt {attempt + 1} to find password field")
+                # Try multiple selectors for password field
+                password_selectors = [
+                    "input[aria-label='Password']",
+                    "input[type='password']",
+                    "input[name='password']",
+                    "input[placeholder*='password']",
+                    "input[placeholder*='Password']",
+                    "textbox[aria-label='Password']",
+                    "input[autocomplete='current-password']"
+                ]
+                
+                password_input = None
+                for selector in password_selectors:
+                    try:
+                        password_input = await page.select(selector)
+                        if password_input:
+                            print(f"Found password field with selector: {selector}")
+                            break
+                    except Exception:
+                        continue
+                
+                if password_input:
+                    await password_input.send_keys(account[1])
+                    await browser.sleep(2)
+                    print("Password entered successfully")
+                    break
+                else:
+                    await browser.sleep(5)
+            except Exception as e:
+                print(f"Attempt {attempt + 1} to find password field failed: {e}")
+                if attempt == max_attempts - 1:
+                    return None
+
+        # Wait for and click login button
+        for attempt in range(max_attempts):
+            try:
+                print(f"Attempt {attempt + 1} to find login button")
+                login_button = await page.select("button[type='submit']")
+                if login_button:
+                    await login_button.click()
+                    await browser.sleep(5)
+                    print("Login button clicked")
+                    break
+                else:
+                    await browser.sleep(5)
+            except Exception as e:
+                print(f"Attempt {attempt + 1} to find login button failed: {e}")
+                if attempt == max_attempts - 1:
+                    return None
+
+        # Wait for page to process login
+        await browser.sleep(10)
+        current_url = await get_current_url(page, discord_loop)
+        print(f"URL after login attempt: {current_url}")
+        
+        # Check for 2FA and handle if needed
+        if current_url and "overview" not in current_url:
+            print("Checking for 2FA...")
             await handle_2fa(page, account, name, botObj, discord_loop)
+            
+        # Wait for redirect after login/2FA and ensure we reach the overview page
+        max_redirect_attempts = 3
+        for attempt in range(max_redirect_attempts):
+            await browser.sleep(10)
+            current_url = await get_current_url(page, discord_loop)
+            print(f"Redirect attempt {attempt + 1}, URL: {current_url}")
+            
+            if current_url and "overview" in current_url:
+                print(f"Successfully reached overview page for {name}")
+                break
+                
+            if attempt < max_redirect_attempts - 1:
+                print(f"Attempting to navigate to overview page...")
+                await page.get("https://www.sofi.com/wealth/app/overview")
+                await browser.sleep(10)
+        else:
+            print(f"Failed to reach overview page after {max_redirect_attempts} attempts")
+            return None
+            
     except Exception as e:
         await sofi_error(
             f"Error logging into account {name}: {e}",
@@ -273,23 +418,107 @@ async def sofi_login_and_account(browser, page, account, name, botObj, discord_l
 
 async def sofi_account_info(browser, discord_loop):
     try:
-        await browser.sleep(1)
-        await browser.get("https://www.sofi.com/wealth/app/overview")
+        print("Starting account info fetch...")
         await browser.sleep(5)
+        
+        # First try to get the overview page
+        print("Navigating to overview page...")
+        page = await browser.get("https://www.sofi.com/wealth/app/overview")
+        await browser.sleep(10)
 
+        # Wait for page to be ready and ensure we're on the right page
+        print("Checking page readiness...")
+        await page.select("body")
+        current_url = await get_current_url(page, discord_loop)
+        print(f"Current URL: {current_url}")
+        
+        # If we're not on the overview page, try logging in again
+        if not current_url or "overview" not in current_url:
+            print("Not on overview page, trying to log in...")
+            page = await browser.get("https://www.sofi.com/login")
+            await browser.sleep(10)
+            
+            # Check if we need to log in
+            login_button = await page.select("button[type='submit']")
+            if login_button:
+                print("Login page detected, need to re-authenticate")
+                return None
+
+        print("Getting cookies...")
         cookies = await browser.cookies.get_all()
         cookies_dict = {cookie.name: cookie.value for cookie in cookies}
-        response = requests.get(
-            "https://www.sofi.com/wealth/backend/v1/json/accounts",
+        csrf_token = cookies_dict.get("SOFI_CSRF_COOKIE") or cookies_dict.get("SOFI_R_CSRF_TOKEN")
+        print(f"CSRF Token found: {bool(csrf_token)}")
+        print(f"Cookie names: {', '.join(cookies_dict.keys())}")
+
+        # Try to get user info first to verify session
+        print("Verifying session with user info request...")
+        user_response = requests.get(
+            "https://www.sofi.com/wealth/backend/api/v1/user",
             impersonate="chrome",
-            headers=build_headers(),
+            headers=build_headers(csrf_token),
             cookies=cookies_dict,
         )
+        print(f"User info response status: {user_response.status_code}")
+        
+        # If user info fails, try alternative endpoints to verify session
+        if user_response.status_code != 200:
+            print("Primary user info endpoint failed, trying alternatives...")
+            # Try alternative user endpoints
+            alternative_endpoints = [
+                "https://www.sofi.com/wealth/backend/api/v3/user",
+                "https://www.sofi.com/wealth/backend/api/v1/user/profile",
+                "https://www.sofi.com/wealth/backend/api/v3/user/profile"
+            ]
+            
+            session_valid = False
+            for endpoint in alternative_endpoints:
+                try:
+                    alt_response = requests.get(
+                        endpoint,
+                        impersonate="chrome",
+                        headers=build_headers(csrf_token),
+                        cookies=cookies_dict,
+                    )
+                    print(f"Alternative endpoint {endpoint} status: {alt_response.status_code}")
+                    if alt_response.status_code == 200:
+                        session_valid = True
+                        break
+                except Exception as e:
+                    print(f"Alternative endpoint {endpoint} failed: {e}")
+                    continue
+            
+            if not session_valid:
+                print("All user info endpoints failed, but proceeding with account fetch...")
+                # Don't return None - the session might still be valid for account endpoints
+
+        # Try the new API endpoint first
+        print("Trying new API endpoint...")
+        headers = build_headers(csrf_token)
+        print(f"Request headers: {headers}")
+        response = requests.get(
+            "https://www.sofi.com/wealth/backend/api/v3/account/list",
+            impersonate="chrome",
+            headers=headers,
+            cookies=cookies_dict,
+        )
+        print(f"API response status: {response.status_code}")
+        print(f"API response text: {response.text[:200]}...")  # Print first 200 chars
 
         if response.status_code != 200:
-            raise Exception(
-                f"Failed to fetch account info, status code: {response.status_code}"
+            print("New API failed, trying old endpoint...")
+            response = requests.get(
+                "https://www.sofi.com/wealth/backend/v1/json/accounts",
+                impersonate="chrome",
+                headers=build_headers(csrf_token),
+                cookies=cookies_dict,
             )
+            print(f"Old API response status: {response.status_code}")
+            print(f"Old API response text: {response.text[:200]}...")  # Print first 200 chars
+
+            if response.status_code != 200:
+                print("Both API endpoints failed, session may be invalid")
+                return None
 
         accounts_data = response.json()
         account_dict = {}
@@ -401,81 +630,103 @@ async def handle_2fa(page, account, name, botObj, discord_loop):
     Handle both authenticator app 2FA and SMS-based 2FA.
     """
     try:
-        # Authenticator app 2FA handling (if secret exists)
-        secret = account[2] if len(account) > 2 else None
-        # Checks for people that don't read the README
-        if isinstance(secret, str) and (
-            secret.lower() == "none" or secret.lower() == "false"
-        ):
-            secret = None
-        if secret is not None:
+        await page.sleep(5)  # Wait for 2FA page to load
+        
+        # Check if we're already on the overview page
+        current_url = await get_current_url(page, discord_loop)
+        if current_url and "overview" in current_url:
+            print(f"Already logged in for {name}, no 2FA needed")
+            return
+
+        # Try to find 2FA input field using multiple selectors
+        twofa_input = None
+        selectors = [
+            "input[aria-label='Enter code']",
+            "input[placeholder*='code']",
+            "input[name*='code']",
+            "input[type='text']",
+            "input[aria-label*='code']",
+            "input[aria-label*='Code']",
+            "input[aria-label*='verification']",
+            "input[aria-label*='Verification']",
+            "input[maxlength='6']",
+            "input[inputmode='numeric']"
+        ]
+        
+        print(f"Searching for 2FA input field with {len(selectors)} different selectors...")
+        for i, selector in enumerate(selectors):
             try:
-                remember = await asyncio.wait_for(
-                    page.select("input[id=rememberBrowser]"), timeout=5
-                )
-                if remember:
-                    await remember.click()
-            except asyncio.TimeoutError:
-                print(
-                    f"'rememberBrowser' checkbox not found for {name}. Continuing without it..."
-                )
+                print(f"Trying selector {i+1}: {selector}")
+                twofa_input = await page.select(selector)
+                if twofa_input:
+                    print(f"Found 2FA input field with selector: {selector}")
+                    break
+            except Exception as e:
+                print(f"Selector {i+1} failed: {e}")
+                continue
 
-            # Continue with 2FA input
-            twofa_input = await page.select("input[id=code]")
-            if not twofa_input:
-                raise Exception(f"Unable to locate 2FA input field for {name}")
+        if not twofa_input:
+            print(f"No 2FA input field found for {name}, checking if already logged in...")
+            # Try navigating to overview page to confirm login status
+            await page.get("https://www.sofi.com/wealth/app/overview")
+            await page.sleep(5)
+            current_url = await get_current_url(page, discord_loop)
+            if current_url and "overview" in current_url:
+                print(f"Successfully logged in for {name} without 2FA")
+                return
+            else:
+                print(f"Login failed for {name}")
+                return
 
-            two_fa_code = get_2fa_code(secret)  # Get the OTP from the authenticator app
+        # Try to click remember browser checkbox using aria-label
+        try:
+            remember = await page.select("input[type='checkbox']")
+            if remember:
+                await remember.click()
+        except Exception as e:
+            print(f"Remember checkbox not found: {e}")
+
+        # Handle authenticator app 2FA
+        secret = account[2] if len(account) > 2 else None
+        if isinstance(secret, str) and secret.lower() in ['none', 'false']:
+            secret = None
+
+        if secret is not None:
+            # Get OTP code and fill it
+            two_fa_code = get_2fa_code(secret)
             await twofa_input.send_keys(two_fa_code)
-            verify_button = await page.find("Verify Code")
+        else:
+            # Try to find SMS text
+            try:
+                sms_text = await page.find("We've sent a text message to:", best_match=True)
+                if sms_text:
+                    if botObj is not None and discord_loop is not None:
+                        sms_code = asyncio.run_coroutine_threadsafe(
+                            getOTPCodeDiscord(botObj, name, timeout=300, loop=discord_loop),
+                            discord_loop,
+                        ).result()
+                        if sms_code is None:
+                            raise Exception(f"Sofi {name} SMS code not received in time...")
+                    else:
+                        sms_code = input("Enter code: ")
+                    await twofa_input.send_keys(sms_code)
+                else:
+                    raise Exception(f"No valid 2FA method found for {name}")
+            except Exception as e:
+                print(f"Error handling SMS 2FA: {e}")
+                return
+
+        # Try to find and click verify button using type or text content
+        try:
+            verify_button = await page.select("button[type='submit']")
+            if not verify_button:
+                verify_button = await page.find("Verify", best_match=True)
             if verify_button:
                 await verify_button.click()
-        else:
-            # Set a timeout duration for finding the SMS 2FA element
-            sms_2fa_element = None
-            try:
-                sms_2fa_element = await asyncio.wait_for(
-                    page.find("We've sent a text message to:", best_match=True),
-                    timeout=5,
-                )
-            except asyncio.TimeoutError:
-                print(
-                    f"SMS 2FA text not found for {name}, proceeding to check for authenticator app 2FA..."
-                )
-
-            if sms_2fa_element:
-                # SMS 2FA handling
-                try:
-                    remember = await asyncio.wait_for(
-                        page.select("input[id=rememberBrowser]"), timeout=5
-                    )
-                    if remember:
-                        await remember.click()
-                except asyncio.TimeoutError:
-                    print(
-                        f"'rememberBrowser' checkbox not found for {name}. Continuing without it..."
-                    )
-
-                sms2fa_input = await page.select("input[id=code]")
-                if not sms2fa_input:
-                    raise Exception(f"Unable to locate SMS 2FA input field for {name}")
-
-                if botObj is not None and discord_loop is not None:
-                    sms_code = asyncio.run_coroutine_threadsafe(
-                        getOTPCodeDiscord(botObj, name, timeout=300, loop=discord_loop),
-                        discord_loop,
-                    ).result()
-                    if sms_code is None:
-                        raise Exception(f"Sofi {name} SMS code not received in time...")
-                else:
-                    sms_code = input("Enter code: ")
-
-                await sms2fa_input.send_keys(sms_code)
-                verify_button = await page.find("Verify Code")
-                if verify_button:
-                    await verify_button.click()
-            else:
-                raise Exception(f"No valid 2FA method found for {name}.")
+                await page.sleep(3)
+        except Exception as e:
+            print(f"Error clicking verify button: {e}")
+            return
 
     except Exception as e:
         await sofi_error(

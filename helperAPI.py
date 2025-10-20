@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromiumService
 from selenium_stealth import stealth
+import undetected_chromedriver as uc
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -567,6 +568,30 @@ def getDriver(DOCKER=False):
     except Exception as e:
         print(f"Error getting Driver: {e}")
         return None
+    return driver
+
+
+def getDriverUndetected(DOCKER=False):
+    # Init undetected webdriver - better for avoiding bot detection
+    try:
+        options = uc.ChromeOptions()
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--log-level=3")
+        if DOCKER:
+            # Special Docker options
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-gpu")
+        if DOCKER or HEADLESS:
+            options.add_argument("--headless=new")
+        
+        # Create driver - let undetected-chromedriver handle everything automatically
+        driver = uc.Chrome(options=options)
+    except Exception as e:
+        print(f"Error getting Undetected Driver: {e}")
+        print("Falling back to regular Selenium driver...")
+        return getDriver(DOCKER)
     return driver
 
 
