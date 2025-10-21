@@ -849,33 +849,82 @@ async def sofi_sell(browser, symbol, quantity, discord_loop, dry_mode=False):
         if not csrf_token:
             raise Exception("Failed to retrieve CSRF token from cookies.")
 
-        # Fetch holdings for the specific symbol
+        # First try the customer holdings endpoint
         holdings_url = f"https://www.sofi.com/wealth/backend/api/v3/customer/holdings/symbol/{symbol}"
         response = requests.get(
             holdings_url, impersonate="chrome", headers=build_headers(), cookies=cookies
         )
 
-        if response.status_code != 200:
-            raise Exception(
-                f"Failed to fetch holdings for {symbol}. Status code: {response.status_code}"
+        account_holding_infos = []
+        
+        if response.status_code == 200:
+            holdings_data = response.json()
+            account_holding_infos = holdings_data.get("accountHoldingInfos", [])
+            print(f"Found {len(account_holding_infos)} holdings for {symbol} from customer endpoint")
+        
+        # If no holdings found via customer endpoint, try account-by-account approach
+        if not account_holding_infos:
+            print(f"No holdings found for {symbol} via customer endpoint, trying account-by-account approach...")
+            
+            # Get all accounts first
+            accounts_url = "https://www.sofi.com/wealth/backend/api/v3/account/list"
+            accounts_response = requests.get(
+                accounts_url, impersonate="chrome", headers=build_headers(csrf_token), cookies=cookies
             )
-
-        holdings_data = response.json()
-        account_holding_infos = holdings_data.get("accountHoldingInfos", [])
+            
+            if accounts_response.status_code == 200:
+                accounts_data = accounts_response.json()
+                print(f"Checking {len(accounts_data)} accounts for {symbol} holdings...")
+                
+                # Check each account individually for the symbol
+                for account in accounts_data:
+                    account_id = account["id"]
+                    try:
+                        account_holdings_url = f"https://www.sofi.com/wealth/backend/api/v3/account/{account_id}/holdings?accountDataType=INTERNAL"
+                        account_response = requests.get(
+                            account_holdings_url, impersonate="chrome", headers=build_headers(), cookies=cookies
+                        )
+                        
+                        if account_response.status_code == 200:
+                            account_holdings_data = account_response.json()
+                            holdings = account_holdings_data.get("holdings", [])
+                            
+                            # Look for the symbol in this account's holdings
+                            for holding in holdings:
+                                if holding.get("symbol", "").upper() == symbol.upper():
+                                    salable_qty = holding.get("salableQuantity", 0)
+                                    if salable_qty > 0:
+                                        account_holding_infos.append({
+                                            "accountId": account_id,
+                                            "salableQuantity": salable_qty,
+                                            "symbol": holding.get("symbol"),
+                                            "accountType": account.get("type", {}).get("description", "Unknown")
+                                        })
+                                        print(f"Found {salable_qty} shares of {symbol} in account {maskString(account_id)}")
+                    except Exception as e:
+                        print(f"Error checking account {account_id}: {e}")
+                        continue
 
         if not account_holding_infos:
-            raise Exception(
-                f"No holdings found for symbol {symbol}. Cannot proceed with the sell order."
+            print(f"No holdings found for symbol {symbol} in any account.")
+            printAndDiscord(
+                f"No holdings found for symbol {symbol}. Cannot proceed with the sell order.",
+                discord_loop,
             )
+            return  # Return instead of raising exception to allow other stocks to be processed
 
         total_available_shares = sum(
             info["salableQuantity"] for info in account_holding_infos
         )
+        print(f"Total available shares of {symbol} across all accounts: {total_available_shares}")
 
         if total_available_shares < quantity:
-            raise Exception(
-                f"Not enough shares to sell. Available: {total_available_shares}, Requested: {quantity}"
+            print(f"Not enough shares to sell. Available: {total_available_shares}, Requested: {quantity}")
+            printAndDiscord(
+                f"Not enough shares to sell {symbol}. Available: {total_available_shares}, Requested: {quantity}",
+                discord_loop,
             )
+            return  # Return instead of raising exception
 
         stock_price = await fetch_stock_price(symbol)
         if stock_price is None:
@@ -887,19 +936,22 @@ async def sofi_sell(browser, symbol, quantity, discord_loop, dry_mode=False):
         for account in account_holding_infos:
             account_id = account["accountId"]
             available_shares = account["salableQuantity"]
+            account_type = account.get("accountType", "Unknown")
 
             # Skip accounts where available shares are less than the quantity to sell
             if available_shares < quantity:
                 printAndDiscord(
-                    f"Not enough shares to sell {quantity} of {symbol} in account {maskString(account_id)}. Only {available_shares} available.",
+                    f"Not enough shares to sell {quantity} of {symbol} in {account_type} account {maskString(account_id)}. Only {available_shares} available.",
                     discord_loop,
                 )
                 continue  # Move to the next account
 
+            print(f"Attempting to sell {quantity} shares of {symbol} from {account_type} account {maskString(account_id)} (available: {available_shares})")
+
             if dry_mode:
                 # Dry mode: Log what would have been done
                 printAndDiscord(
-                    f"[DRY MODE] Would place sell order for {quantity} shares of {symbol} in account {maskString(account_id)}",
+                    f"[DRY MODE] Would place sell order for {quantity} shares of {symbol} in {account_type} account {maskString(account_id)}",
                     discord_loop,
                 )
                 continue
@@ -926,9 +978,15 @@ async def sofi_sell(browser, symbol, quantity, discord_loop, dry_mode=False):
                     csrf_token=csrf_token,
                     discord_loop=discord_loop,
                 )
-            if result["header"] == "Your order is placed.":  # Success
+            if result and result.get("header") == "Your order is placed.":  # Success
                 printAndDiscord(
-                    f"Successfully sold {quantity} of {symbol} in account {maskString(account_id)}",
+                    f"Successfully sold {quantity} of {symbol} in {account_type} account {maskString(account_id)}",
+                    discord_loop,
+                )
+                return  # Exit after successful sale
+            else:
+                printAndDiscord(
+                    f"Failed to sell {quantity} of {symbol} in {account_type} account {maskString(account_id)}",
                     discord_loop,
                 )
     except Exception as e:
