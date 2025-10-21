@@ -451,74 +451,21 @@ async def sofi_account_info(browser, discord_loop):
         print(f"CSRF Token found: {bool(csrf_token)}")
         print(f"Cookie names: {', '.join(cookies_dict.keys())}")
 
-        # Try to get user info first to verify session
-        print("Verifying session with user info request...")
-        user_response = requests.get(
-            "https://www.sofi.com/wealth/backend/api/v1/user",
+        # Skip user info verification - go directly to working endpoint
+        print("Fetching accounts using working endpoint...")
+        
+        # Use the old working endpoint directly (new v3 endpoint returns 404)
+        response = requests.get(
+            "https://www.sofi.com/wealth/backend/v1/json/accounts",
             impersonate="chrome",
             headers=build_headers(csrf_token),
             cookies=cookies_dict,
         )
-        print(f"User info response status: {user_response.status_code}")
-        
-        # If user info fails, try alternative endpoints to verify session
-        if user_response.status_code != 200:
-            print("Primary user info endpoint failed, trying alternatives...")
-            # Try alternative user endpoints
-            alternative_endpoints = [
-                "https://www.sofi.com/wealth/backend/api/v3/user",
-                "https://www.sofi.com/wealth/backend/api/v1/user/profile",
-                "https://www.sofi.com/wealth/backend/api/v3/user/profile"
-            ]
-            
-            session_valid = False
-            for endpoint in alternative_endpoints:
-                try:
-                    alt_response = requests.get(
-                        endpoint,
-                        impersonate="chrome",
-                        headers=build_headers(csrf_token),
-                        cookies=cookies_dict,
-                    )
-                    print(f"Alternative endpoint {endpoint} status: {alt_response.status_code}")
-                    if alt_response.status_code == 200:
-                        session_valid = True
-                        break
-                except Exception as e:
-                    print(f"Alternative endpoint {endpoint} failed: {e}")
-                    continue
-            
-            if not session_valid:
-                print("All user info endpoints failed, but proceeding with account fetch...")
-                # Don't return None - the session might still be valid for account endpoints
-
-        # Try the new API endpoint first
-        print("Trying new API endpoint...")
-        headers = build_headers(csrf_token)
-        print(f"Request headers: {headers}")
-        response = requests.get(
-            "https://www.sofi.com/wealth/backend/api/v3/account/list",
-            impersonate="chrome",
-            headers=headers,
-            cookies=cookies_dict,
-        )
-        print(f"API response status: {response.status_code}")
-        print(f"API response text: {response.text[:200]}...")  # Print first 200 chars
+        print(f"Accounts API response status: {response.status_code}")
 
         if response.status_code != 200:
-            print("New API failed, trying old endpoint...")
-            response = requests.get(
-                "https://www.sofi.com/wealth/backend/v1/json/accounts",
-                impersonate="chrome",
-                headers=build_headers(csrf_token),
-                cookies=cookies_dict,
-            )
-            print(f"Old API response status: {response.status_code}")
-            print(f"Old API response text: {response.text[:200]}...")  # Print first 200 chars
-
-            if response.status_code != 200:
-                print("Both API endpoints failed, session may be invalid")
-                return None
+            print("Failed to fetch accounts, session may be invalid")
+            return None
 
         accounts_data = response.json()
         account_dict = {}
